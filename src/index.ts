@@ -22,6 +22,17 @@ import connectDB from './config/db';
 import auth from './middleware/auth';
 import CollaborationRoom from './models/CollaborationRoom';
 import { uploadFile, getFile } from './utils/fileStorage';
+import { upload as fileUpload, handleFileUpload, handleFileDownload } from './utils/fileHandlers';
+import { Request } from 'express';
+import { handleWhiteboardDraw, handleWhiteboardClear, handleWhiteboardSync } from './utils/whiteboardHandlers';
+
+// Extend Express Request type
+interface AuthenticatedRequest extends Request {
+  user: {
+    id: string;
+    [key: string]: any;
+  };
+}
 
 // Types
 interface Participant {
@@ -303,9 +314,9 @@ router.post('/api/rooms', auth, async (req: any, res) => {
   } catch (error) {
     console.error('Error creating room:', error);
     return res.status(500).json({ error: 'Failed to create room' });
-  }
+    }
 });
-
+  
 // Get all rooms for a user
 router.get('/api/rooms', auth, async (req: any, res) => {
   try {
@@ -315,7 +326,7 @@ router.get('/api/rooms', auth, async (req: any, res) => {
     const dbRooms = await CollaborationRoom.find({
       'participants.userId': new mongoose.Types.ObjectId(userId)
     }).select('_id name description type participants createdAt updatedAt');
-    
+  
     // Map to the format expected by the frontend
     const mappedRooms = dbRooms.map(room => ({
       _id: room._id.toString(),
@@ -432,8 +443,8 @@ router.put('/api/rooms/:roomId', auth, async (req: any, res) => {
     
     if (!dbRoom) {
       return res.status(404).json({ error: 'Room not found' });
-    }
-    
+  }
+  
     // Check if user is the creator
     if (dbRoom.createdBy.toString() !== userId) {
       return res.status(403).json({ error: 'Not authorized to update this room' });
@@ -517,7 +528,7 @@ router.post('/api/rooms/:roomId/participant', auth, async (req: any, res) => {
     });
     
     await dbRoom.save();
-    
+
     // Update in-memory room
     const memoryRoom = rooms.get(roomId);
     if (memoryRoom) {
@@ -744,6 +755,64 @@ router.delete('/api/rooms/:roomId', auth, async (req: any, res) => {
   }
 });
 
+// File upload route
+app.post('/upload/:roomId', auth, upload.single('file'), async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+
+    const roomId = req.params.roomId;
+    const room = await CollaborationRoom.findById(roomId);
+    if (!room) {
+      return res.status(404).json({ message: 'Room not found' });
+    }
+
+    // Create a fake socket for file upload handling
+    const fakeSocket = {
+      data: { userId: req.user.id },
+      to: () => ({ emit: () => {} })
+    };
+
+    const message = await handleFileUpload(fakeSocket as any, roomId, req.file);
+    if (!message) {
+      return res.status(500).json({ message: 'Failed to upload file' });
+    }
+
+    res.json({
+      message: 'File uploaded successfully',
+      fileUrl: message.metadata.fileUrl,
+      messageId: message._id
+    });
+  } catch (error) {
+    console.error('Error uploading file:', error);
+    res.status(500).json({ message: 'Failed to upload file' });
+  }
+});
+
+// File download route
+app.get('/download/:fileId', auth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const fileId = req.params.fileId;
+    
+    // Create a fake socket for file download handling
+    const fakeSocket = {
+      data: { userId: req.user.id },
+      emit: () => {}
+    };
+
+    const filePath = await handleFileDownload(fakeSocket as any, fileId);
+    if (!filePath) {
+      return res.status(404).json({ message: 'File not found' });
+    }
+
+    res.download(filePath);
+  } catch (error) {
+    console.error('Error downloading file:', error);
+    res.status(500).json({ message: 'Failed to download file' });
+  }
+});
+
 // Socket.IO connection handler
 io.on('connection', (socket) => {
   console.log(`Socket connected: ${socket.id}`);
@@ -770,8 +839,8 @@ io.on('connection', (socket) => {
             });
           }
         }
-      }
-      
+  }
+  
       // Join new room
       socket.join(roomId);
       userRooms.set(userId, roomId);
@@ -864,15 +933,15 @@ io.on('connection', (socket) => {
       
       // Emit room data to the user
       socket.emit('room-data', { room });
-      
+    
       // Emit to other participants
       socket.to(roomId).emit('participant-joined', {
         userId,
         name: userName,
         avatar: userAvatar,
         room
-      });
-      
+    });
+    
       console.log(`User ${userId} joined room ${roomId}`);
     } catch (error) {
       console.error('Error joining room:', error);
@@ -1151,69 +1220,59 @@ io.on('connection', (socket) => {
     }
   });
   
-  // File upload
-  socket.on('upload-file', async ({ roomId, userId, file }) => {
-    const room = rooms.get(roomId);
-    
-    if (!room) {
-      socket.emit('error', 'Room not found');
-      return;
-    }
-
+  // File upload event
+  socket.on('file:upload', async (data: { roomId: string; file: Express.Multer.File }) => {
     try {
-      // Try to upload to backend first if token is available
-      let fileData = null;
-      const authToken = socket.handshake.auth.token || 
-                      socket.handshake.headers.authorization;
-      if (authToken) {
-        fileData = await uploadFileToBackend(roomId, file, userId, authToken.split(' ')[1]);
-      }
-
-      // Fallback to local storage if backend upload failed or no token
-      if (!fileData) {
-        // Save file locally (implementation depends on your file object structure)
-        const timestamp = Date.now();
-        const filename = `${timestamp}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-        const filepath = path.join(uploadsDir, filename);
-        
-        fs.writeFileSync(filepath, file.buffer);
-        
-        fileData = {
-          id: uuidv4(),
-          name: file.originalname,
-          size: file.size,
-          type: file.mimetype,
-          uploadedBy: userId,
-          uploadedAt: new Date(),
-          url: `/uploads/${filename}`
-        };
-      }
-      
-      // Add file to room
-      room.files.push(fileData);
-      
-      // Add system message about file upload
-      const message: Message = {
-        id: uuidv4(),
-        userId,
-        content: `Uploaded file: ${file.originalname}`,
-        timestamp: new Date(),
-        type: 'system'
-      };
-      
-      room.messages.push(message);
-      
-      // Notify room about new file
-      io.to(roomId).emit('file-uploaded', {
-        file: fileData,
-        message,
-        room
-      });
-      
-      console.log(`File uploaded to room ${roomId} by ${userId}: ${file.originalname}`);
+      const { roomId, file } = data;
+      await handleFileUpload(socket, roomId, file);
     } catch (error) {
       console.error('Error handling file upload:', error);
-      socket.emit('error', 'Failed to upload file');
+      socket.emit('error', { message: 'Failed to upload file' });
+      }
+  });
+  
+  // File download event
+  socket.on('file:download', async (data: { fileId: string }) => {
+    try {
+      const { fileId } = data;
+      const filePath = await handleFileDownload(socket, fileId);
+      if (filePath) {
+        socket.emit('file:ready', { fileId, filePath });
+      }
+    } catch (error) {
+      console.error('Error handling file download:', error);
+      socket.emit('error', { message: 'Failed to download file' });
+    }
+  });
+  
+  // Whiteboard events
+  socket.on('whiteboard:draw', async (data: { roomId: string; elements: any[] }) => {
+    try {
+      const { roomId, elements } = data;
+      await handleWhiteboardDraw(socket, roomId, elements);
+    } catch (error) {
+      console.error('Error handling whiteboard draw:', error);
+      socket.emit('error', { message: 'Failed to update whiteboard' });
+    }
+  });
+
+  socket.on('whiteboard:clear', async (data: { roomId: string }) => {
+    try {
+      const { roomId } = data;
+      await handleWhiteboardClear(socket, roomId);
+    } catch (error) {
+      console.error('Error handling whiteboard clear:', error);
+      socket.emit('error', { message: 'Failed to clear whiteboard' });
+    }
+  });
+
+  socket.on('whiteboard:sync', async (data: { roomId: string }) => {
+    try {
+      const { roomId } = data;
+      await handleWhiteboardSync(socket, roomId);
+    } catch (error) {
+      console.error('Error handling whiteboard sync:', error);
+      socket.emit('error', { message: 'Failed to sync whiteboard' });
     }
   });
   
